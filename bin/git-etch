@@ -1,0 +1,179 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+case "${1-}" in
+  --help|-h)
+    printf '%s\n' 'usage: git etch [anything]' '' "You typed 'etch' instead of 'fetch'. It plays a sound. That's the whole tool." 'Do not install this on your work machine.'
+    exit 0
+    ;;
+  --version)
+    printf '%s\n' 'git-etch 0.1.0'
+    exit 0
+    ;;
+esac
+
+printf '%s\n' "git: 'etch' is not a git command. It is, however, an ecchi one." '' 'Nothing fetched. Everything etched.'
+
+self=$0
+case "$self" in
+  */*|*\\*) ;;
+  *) self=$(command -v -- "$self") || exit 0 ;;
+esac
+dir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd) || exit 0
+sounds_dir=$dir/sounds
+# install.sh は、ユーザーが Pincree の音声の取得に同意したときだけこのファイルを置く。
+pincree_sounds_b64=$sounds_dir/pincree-sounds.b64
+download_lock=$sounds_dir/.pincree-download.lock
+# 未取得の音声が当たると再生の前に取得を待つので、install.sh の一括ダウンロード (60秒) より短くする。
+download_timeout=15
+
+random_below() {
+  # /dev/urandom が読めない環境では、時刻とプロセス ID で代用する。
+  random=$(od -A n -t u4 -N 4 /dev/urandom 2>/dev/null | tr -d ' ')
+  [ -n "$random" ] || random=$(( $(date +%s) + $$ ))
+  printf '%s\n' $((random % $1))
+}
+
+# 以下の Pincree の取得処理は install.sh にも同じものがある。直すときは両方そろえる。
+
+# 1行に「バイト数 URL」を出力する。デコード後の JSON Lines はキーの順序に頼らずに読む。
+pincree_entries() {
+  {
+    base64 -d <"$pincree_sounds_b64" 2>/dev/null ||
+      base64 -D <"$pincree_sounds_b64" 2>/dev/null ||
+      openssl base64 -d <"$pincree_sounds_b64" 2>/dev/null
+  } | awk '{
+    url = ""; bytes = ""
+    if (match($0, /"url"[ \t]*:[ \t]*"[^"]*"/)) {
+      url = substr($0, RSTART, RLENGTH); sub(/^"url"[ \t]*:[ \t]*"/, "", url); sub(/"$/, "", url)
+    }
+    if (match($0, /"bytes"[ \t]*:[ \t]*[0-9]+/)) {
+      bytes = substr($0, RSTART, RLENGTH); sub(/^"bytes"[ \t]*:[ \t]*/, "", bytes)
+    }
+    if (url != "" && bytes != "") print bytes, url
+  }'
+}
+
+read_bytes() {
+  dd if="$1" bs=1 skip="$2" count="$3" 2>/dev/null
+}
+
+write_le32() {
+  value=$3
+  bytes=$(printf '\\%03o\\%03o\\%03o\\%03o' \
+    $((value & 255)) $((value >> 8 & 255)) $((value >> 16 & 255)) $((value >> 24 & 255)))
+  # shellcheck disable=SC2059 # 書式文字列は、直前で組み立てた8進エスケープそのもの。
+  printf "$bytes" | dd of="$1" bs=1 seek="$2" count=4 conv=notrunc 2>/dev/null
+}
+
+# 先頭から JSON Lines の bytes の分 (ヘッダと約3秒の音声) だけを取得し、切り詰めたファイルも正しい WAV として読めるように RIFF チャンクと data チャンクのサイズを書き換える。
+fetch_pincree_clip() {
+  clip_bytes=$1
+  url=$2
+  out=$sounds_dir/pincree-${url##*/}
+  raw=$out.$$.part
+  clip=$out.$$.clip
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 5 --max-time "$download_timeout" -r "0-$((clip_bytes - 1))" -o "$raw" "$url"
+  else
+    wget -q -T "$download_timeout" --header="Range: bytes=0-$((clip_bytes - 1))" -O "$raw" "$url"
+  fi || { rm -f -- "$raw"; return 1; }
+  # サーバーが Range を無視してファイル全体を返した場合も、ここで切り詰められる。
+  dd if="$raw" of="$clip" bs="$clip_bytes" count=1 2>/dev/null
+  rm -f -- "$raw"
+  if [ "$(wc -c <"$clip" | tr -d ' ')" -ne "$clip_bytes" ] ||
+     [ "$(read_bytes "$clip" 0 4)" != RIFF ] ||
+     [ "$(read_bytes "$clip" 8 4)" != WAVE ] ||
+     [ "$(read_bytes "$clip" 36 4)" != data ]; then
+    rm -f -- "$clip"
+    return 1
+  fi
+  write_le32 "$clip" 4 $((clip_bytes - 8))
+  write_le32 "$clip" 40 $((clip_bytes - 44))
+  mv -- "$clip" "$out"
+}
+
+fetch_with_lock() {
+  command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || return 1
+  # 前回の取得が途中で止まってロックが残っていても、10分たてば取り直す。
+  if [ -n "$(find "$download_lock" -prune -mmin +10 2>/dev/null)" ]; then
+    rmdir -- "$download_lock" 2>/dev/null
+  fi
+  mkdir -- "$download_lock" 2>/dev/null || return 1
+  fetch_pincree_clip "$1" "$2"
+  fetched=$?
+  rmdir -- "$download_lock" 2>/dev/null
+  return "$fetched"
+}
+
+local_count=0
+for candidate in "$sounds_dir"/*.wav; do
+  [ -f "$candidate" ] && local_count=$((local_count + 1))
+done
+
+pick_local_sound() {
+  pick=$(( $(random_below "$local_count") + 1 ))
+  index=0
+  for candidate in "$sounds_dir"/*.wav; do
+    [ -f "$candidate" ] || continue
+    index=$((index + 1))
+    if [ "$index" -eq "$pick" ]; then
+      sound=$candidate
+      return 0
+    fi
+  done
+}
+
+missing=
+if [ -f "$pincree_sounds_b64" ]; then
+  missing=$(pincree_entries | while read -r clip_bytes url; do
+    [ -f "$sounds_dir/pincree-${url##*/}" ] || printf '%s %s\n' "$clip_bytes" "$url"
+  done)
+fi
+missing_count=0
+[ -z "$missing" ] || missing_count=$(printf '%s\n' "$missing" | wc -l | tr -d ' ')
+
+# 未取得の Pincree の音声も候補に入れて、全体から1つ選ぶ。
+# 未取得のものが当たったときだけ取得するので、取得済みの数に関係なく、どの音声も同じ確率で鳴る。
+total=$((local_count + missing_count))
+[ "$total" -gt 0 ] || exit 0
+pick=$(random_below "$total")
+sound=
+if [ "$pick" -ge "$local_count" ]; then
+  entry=$(printf '%s\n' "$missing" | sed -n "$((pick - local_count + 1))p")
+  url=${entry#* }
+  if fetch_with_lock "${entry%% *}" "$url" </dev/null >/dev/null 2>&1; then
+    sound=$sounds_dir/pincree-${url##*/}
+  fi
+fi
+# 取得に失敗したときや、ほかの実行が取得中のときは、手元にある音声から選び直す。
+if [ -z "$sound" ]; then
+  [ "$local_count" -gt 0 ] || exit 0
+  pick_local_sound
+fi
+
+case "$(uname -s)" in
+  Darwin)
+    afplay "$sound" >/dev/null 2>&1
+    ;;
+  Linux)
+    if command -v pw-play >/dev/null 2>&1; then
+      pw-play "$sound" >/dev/null 2>&1
+    elif command -v paplay >/dev/null 2>&1; then
+      paplay "$sound" >/dev/null 2>&1
+    elif command -v aplay >/dev/null 2>&1; then
+      aplay -q "$sound" >/dev/null 2>&1
+    elif command -v ffplay >/dev/null 2>&1; then
+      ffplay -nodisp -autoexit -loglevel error "$sound" >/dev/null 2>&1
+    elif command -v mpv >/dev/null 2>&1; then
+      mpv --no-video --really-quiet "$sound" >/dev/null 2>&1
+    fi
+    ;;
+  MINGW*|MSYS*|CYGWIN*)
+    win_path=$(cygpath -w "$sound" 2>/dev/null) || exit 0
+    # PowerShell の文字列リテラルの中でパスが壊れないように、シングルクォートを2つに重ねる。
+    quoted=$(printf '%s' "$win_path" | sed "s/'/''/g")
+    powershell.exe -NoProfile -NonInteractive -Command "(New-Object System.Media.SoundPlayer '$quoted').PlaySync()" >/dev/null 2>&1
+    ;;
+esac
+exit 0
